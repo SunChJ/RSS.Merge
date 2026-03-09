@@ -9,11 +9,16 @@ A small RSS merge service (rss.app-like “bundle into one feed”).
 - De-dup by `guid`/`link`
 - Sort by publish time desc
 - Cron pre-warms merged output
-- Minimal dashboard at `/admin` to manage feed list
+- Minimal dashboard at `/admin` to manage feed list (requires CONFIG KV binding)
 
 ## Deploy
 
-### Option 1 (recommended): zero manual KV id setup
+### Option 1 (recommended for Git deployments): no KV at all
+
+Use Cloudflare Workers Git integration, set `FEEDS_JSON` (and optionally `COLLECTIONS_JSON`) as Worker vars.
+No KV ids required.
+
+### Option 2: local bootstrap KV (optional)
 
 1. `npm i`
 2. `npm run setup` (creates 2 KV namespaces + patches `wrangler.toml` automatically)

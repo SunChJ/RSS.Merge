@@ -1,7 +1,15 @@
 export interface Env {
-  CONFIG: KVNamespace;
-  CACHE: KVNamespace;
+  // Optional KV bindings. If not provided, the worker still runs using vars + Cache API.
+  CONFIG?: KVNamespace;
+  CACHE?: KVNamespace;
+
+  // Optional admin auth (only meaningful when CONFIG KV is bound)
   ADMIN_TOKEN?: string;
+
+  // Git-deploy mode config (when CONFIG KV is not bound)
+  FEEDS_JSON?: string;
+  COLLECTIONS_JSON?: string;
+
   FEED_TTL_MINUTES?: string;
   MERGED_TTL_MINUTES?: string;
   TITLE?: string;
@@ -146,6 +154,45 @@ function isAuthed(req: Request, env: Env) {
   return h === `Bearer ${token}`;
 }
 
+function kvEnabled(env: Env): boolean {
+  return !!env.CONFIG;
+}
+
+function parseFeedsJson(env: Env): Record<string, string[]> {
+  const raw = (env.FEEDS_JSON || "").trim();
+  if (!raw) return { default: [] };
+  try {
+    const parsed = JSON.parse(raw);
+    const out: Record<string, string[]> = {};
+    if (parsed && typeof parsed === "object") {
+      for (const [k, v] of Object.entries(parsed)) {
+        if (!Array.isArray(v)) continue;
+        out[normalizeCollection(k)] = v
+          .filter((x) => typeof x === "string" && x.trim())
+          .map((s) => s.trim());
+      }
+    }
+    if (!out.default) out.default = [];
+    return out;
+  } catch {
+    return { default: [] };
+  }
+}
+
+function parseCollectionsJson(env: Env): string[] {
+  const raw = (env.COLLECTIONS_JSON || "").trim();
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((x) => typeof x === "string" && x.trim())
+      .map((s) => normalizeCollection(s));
+  } catch {
+    return [];
+  }
+}
+
 function normalizeCollection(raw: string | null): string {
   const v = (raw || "default").trim();
   const cleaned = v.replace(/[^a-zA-Z0-9._-]/g, "-").slice(0, 64);
@@ -153,7 +200,14 @@ function normalizeCollection(raw: string | null): string {
 }
 
 async function getCollections(env: Env): Promise<CollectionConfig> {
-  const raw = await env.CONFIG.get(COLLECTIONS_KEY);
+  if (!kvEnabled(env)) {
+    const fromFeeds = Object.keys(parseFeedsJson(env)).map((k) => normalizeCollection(k));
+    const fromVars = parseCollectionsJson(env);
+    const uniq = Array.from(new Set(["default", ...fromVars, ...fromFeeds]));
+    return { collections: uniq };
+  }
+
+  const raw = await env.CONFIG!.get(COLLECTIONS_KEY);
   if (!raw) return { collections: ["default"] };
   try {
     const parsed = JSON.parse(raw);
@@ -170,14 +224,20 @@ async function getCollections(env: Env): Promise<CollectionConfig> {
 }
 
 async function addCollection(env: Env, name: string) {
+  if (!kvEnabled(env)) return;
   const cfg = await getCollections(env);
   cfg.collections.push(normalizeCollection(name));
   const uniq = Array.from(new Set(cfg.collections));
-  await env.CONFIG.put(COLLECTIONS_KEY, JSON.stringify({ collections: uniq }));
+  await env.CONFIG!.put(COLLECTIONS_KEY, JSON.stringify({ collections: uniq }));
 }
 
 async function getConfig(env: Env, collection: string): Promise<FeedConfig> {
-  const raw = await env.CONFIG.get(CONFIG_PREFIX + collection);
+  if (!kvEnabled(env)) {
+    const map = parseFeedsJson(env);
+    return { feeds: map[collection] || [] };
+  }
+
+  const raw = await env.CONFIG!.get(CONFIG_PREFIX + collection);
   if (!raw) return { feeds: [] };
   try {
     const parsed = JSON.parse(raw);
@@ -191,8 +251,9 @@ async function getConfig(env: Env, collection: string): Promise<FeedConfig> {
 }
 
 async function setConfig(env: Env, collection: string, cfg: FeedConfig) {
+  if (!kvEnabled(env)) return;
   const uniq = Array.from(new Set(cfg.feeds.map((s) => s.trim()).filter(Boolean)));
-  await env.CONFIG.put(CONFIG_PREFIX + collection, JSON.stringify({ feeds: uniq }));
+  await env.CONFIG!.put(CONFIG_PREFIX + collection, JSON.stringify({ feeds: uniq }));
 }
 
 function xmlText(el: Element | null): string {
@@ -286,13 +347,62 @@ function sha1Hex(input: string): Promise<string> {
   });
 }
 
+async function cacheGetJson(key: string): Promise<any | null> {
+  const req = new Request(`https://cache.local/${key}`);
+  const resp = await caches.default.match(req);
+  if (!resp) return null;
+  try {
+    return await resp.json();
+  } catch {
+    return null;
+  }
+}
+
+async function cachePutJson(key: string, value: unknown, ttlSeconds: number) {
+  const req = new Request(`https://cache.local/${key}`);
+  const body = JSON.stringify(value);
+  const resp = new Response(body, {
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": `max-age=${ttlSeconds}`,
+    },
+  });
+  await caches.default.put(req, resp);
+}
+
 async function getFeedItemsCached(env: Env, feedUrl: string): Promise<Item[]> {
   const ttlMin = mins(env, "FEED_TTL_MINUTES", 20);
-  const key = `feed:${await sha1Hex(feedUrl)}`;
-  const cached = await env.CACHE.get(key, { type: "json" });
-  if (cached && typeof cached === "object" && (cached as any).ts && (cached as any).items) {
-    const age = now() - Number((cached as any).ts);
-    if (age < ttlMin * 60_000) return (cached as any).items as Item[];
+  const ttlSeconds = ttlMin * 60;
+  const hash = await sha1Hex(feedUrl);
+
+  // 1) KV cache (if bound)
+  if (env.CACHE) {
+    const key = `feed:${hash}`;
+    const cached = await env.CACHE.get(key, { type: "json" });
+    if (cached && typeof cached === "object" && (cached as any).ts && (cached as any).items) {
+      const age = now() - Number((cached as any).ts);
+      if (age < ttlMin * 60_000) return (cached as any).items as Item[];
+    }
+
+    const resp = await fetch(feedUrl, {
+      headers: {
+        "user-agent": "RSS.Merge/1.0",
+        accept: "application/xml,text/xml,application/rss+xml,application/atom+xml,*/*;q=0.8",
+      },
+      cf: { cacheTtl: ttlSeconds, cacheEverything: false },
+    });
+    if (!resp.ok) return [];
+    const xml = await resp.text();
+    const items = parseFeedXml(xml);
+    await env.CACHE.put(key, JSON.stringify({ ts: now(), items }), { expirationTtl: ttlSeconds });
+    return items;
+  }
+
+  // 2) Cache API (Git-deploy mode)
+  const cacheKey = `feed-json/${hash}`;
+  const cached = await cacheGetJson(cacheKey);
+  if (cached && typeof cached === "object" && (cached as any).items) {
+    return (cached as any).items as Item[];
   }
 
   const resp = await fetch(feedUrl, {
@@ -300,12 +410,12 @@ async function getFeedItemsCached(env: Env, feedUrl: string): Promise<Item[]> {
       "user-agent": "RSS.Merge/1.0",
       accept: "application/xml,text/xml,application/rss+xml,application/atom+xml,*/*;q=0.8",
     },
-    cf: { cacheTtl: ttlMin * 60, cacheEverything: false },
+    cf: { cacheTtl: ttlSeconds, cacheEverything: false },
   });
   if (!resp.ok) return [];
   const xml = await resp.text();
   const items = parseFeedXml(xml);
-  await env.CACHE.put(key, JSON.stringify({ ts: now(), items }), { expirationTtl: ttlMin * 60 });
+  await cachePutJson(cacheKey, { items }, ttlSeconds);
   return items;
 }
 
@@ -366,18 +476,45 @@ async function buildMerged(env: Env, collection: string): Promise<string> {
   return toRss2(env, limited);
 }
 
+async function cacheGetText(key: string): Promise<string | null> {
+  const req = new Request(`https://cache.local/${key}`);
+  const resp = await caches.default.match(req);
+  if (!resp) return null;
+  return await resp.text();
+}
+
+async function cachePutText(key: string, value: string, ttlSeconds: number, contentType: string) {
+  const req = new Request(`https://cache.local/${key}`);
+  const resp = new Response(value, {
+    headers: {
+      "content-type": contentType,
+      "cache-control": `max-age=${ttlSeconds}`,
+    },
+  });
+  await caches.default.put(req, resp);
+}
+
 async function getMergedCached(env: Env, collection: string): Promise<string> {
   const ttlMin = mins(env, "MERGED_TTL_MINUTES", 10);
+  const ttlSeconds = ttlMin * 60;
   const key = MERGED_PREFIX + collection;
-  const cached = await env.CACHE.get(key);
-  const tsRaw = await env.CACHE.get(key + ":ts");
-  if (cached && tsRaw) {
-    const age = now() - Number(tsRaw);
-    if (age < ttlMin * 60_000) return cached;
+
+  // 1) KV cache (if bound)
+  if (env.CACHE) {
+    const cached = await env.CACHE.get(key);
+    if (cached) return cached;
+    const xml = await buildMerged(env, collection);
+    await env.CACHE.put(key, xml, { expirationTtl: ttlSeconds });
+    return xml;
   }
+
+  // 2) Cache API (Git-deploy mode)
+  const cacheKey = `merged-xml/${collection}`;
+  const cached = await cacheGetText(cacheKey);
+  if (cached) return cached;
+
   const xml = await buildMerged(env, collection);
-  await env.CACHE.put(key, xml, { expirationTtl: ttlMin * 60 });
-  await env.CACHE.put(key + ":ts", String(now()), { expirationTtl: ttlMin * 60 });
+  await cachePutText(cacheKey, xml, ttlSeconds, "application/rss+xml; charset=utf-8");
   return xml;
 }
 
@@ -411,11 +548,20 @@ export default {
     }
 
     if (url.pathname === "/admin") {
+      if (!kvEnabled(env)) {
+        return new Response(
+          "Admin is disabled in Git-deploy mode (no CONFIG KV binding).\n\n" +
+            "Set FEEDS_JSON/COLLECTIONS_JSON vars, or bind CONFIG KV to enable /admin.",
+          { headers: { "content-type": "text/plain; charset=utf-8" } },
+        );
+      }
       if (!isAuthed(req, env)) return new Response("Unauthorized", { status: 401 });
       return new Response(ADMIN_HTML, { headers: { "content-type": "text/html; charset=utf-8" } });
     }
 
     if (url.pathname === "/api/collections") {
+      if (!kvEnabled(env))
+        return new Response(JSON.stringify({ error: "admin_disabled_no_kv" }), { status: 501 });
       if (!isAuthed(req, env))
         return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
       if (req.method === "GET") {
@@ -432,6 +578,8 @@ export default {
     }
 
     if (url.pathname === "/api/feeds") {
+      if (!kvEnabled(env))
+        return new Response(JSON.stringify({ error: "admin_disabled_no_kv" }), { status: 501 });
       if (!isAuthed(req, env))
         return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
       const collection = normalizeCollection(url.searchParams.get("collection"));
@@ -448,8 +596,8 @@ export default {
         await setConfig(env, collection, cfg);
         // bust merged cache
         const key = MERGED_PREFIX + collection;
-        ctx.waitUntil(env.CACHE.delete(key));
-        ctx.waitUntil(env.CACHE.delete(key + ":ts"));
+        ctx.waitUntil(env.CACHE?.delete(key));
+        ctx.waitUntil(env.CACHE?.delete(key + ":ts"));
         return Response.json({ ok: true });
       }
       if (req.method === "DELETE") {
@@ -459,8 +607,8 @@ export default {
         cfg.feeds = cfg.feeds.filter((x) => x !== u);
         await setConfig(env, collection, cfg);
         const key = MERGED_PREFIX + collection;
-        ctx.waitUntil(env.CACHE.delete(key));
-        ctx.waitUntil(env.CACHE.delete(key + ":ts"));
+        ctx.waitUntil(env.CACHE?.delete(key));
+        ctx.waitUntil(env.CACHE?.delete(key + ":ts"));
         return Response.json({ ok: true });
       }
       return new Response(JSON.stringify({ error: "method not allowed" }), { status: 405 });

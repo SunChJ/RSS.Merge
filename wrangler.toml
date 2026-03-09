@@ -6,20 +6,36 @@ compatibility_date = "2026-03-09"
 # - CONFIG: stores feed list (JSON)
 # - CACHE: stores per-feed parsed items + merged output
 
-[[kv_namespaces]]
-binding = "CONFIG"
-id = "REPLACE_WITH_CONFIG_KV_ID"
-
-[[kv_namespaces]]
-binding = "CACHE"
-id = "REPLACE_WITH_CACHE_KV_ID"
+# KV namespaces are OPTIONAL.
+# If you bind them, you get:
+# - persistent config storage
+# - KV-based parsed-item caching
+#
+# If you do NOT bind them, the worker still works in “Git-deploy mode”:
+# - config comes from FEEDS_JSON / COLLECTIONS_JSON vars
+# - caching uses the Workers Cache API
+#
+# [[kv_namespaces]]
+# binding = "CONFIG"
+# id = "REPLACE_WITH_CONFIG_KV_ID"
+#
+# [[kv_namespaces]]
+# binding = "CACHE"
+# id = "REPLACE_WITH_CACHE_KV_ID"
 
 [triggers]
 crons = ["*/15 * * * *"]
 
 [vars]
-# Optional: set to require auth on /admin and /api/*
+# Optional: set to require auth on /admin and /api/* (only meaningful when CONFIG KV is bound)
 # ADMIN_TOKEN = "..."
+
+# Git-deploy mode config (when CONFIG KV is NOT bound):
+# FEEDS_JSON should be a JSON object: {"default": ["https://a/feed.xml", ...], "hn": [...]}
+# COLLECTIONS_JSON optional: ["default","hn",...]
+# FEEDS_JSON = "{\"default\":[\"https://example.com/feed.xml\"]}"
+# COLLECTIONS_JSON = "[\"default\"]"
+
 FEED_TTL_MINUTES = "20"
 MERGED_TTL_MINUTES = "10"
 TITLE = "Merged Feed"
