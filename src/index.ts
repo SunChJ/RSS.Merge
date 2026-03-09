@@ -11,6 +11,10 @@ export interface Env {
 
 type FeedConfig = { feeds: string[] };
 
+type CollectionConfig = {
+  collections: string[];
+};
+
 type Item = {
   id: string; // guid/link fallback
   link: string;
@@ -19,43 +23,72 @@ type Item = {
   description?: string;
 };
 
-const CONFIG_KEY = "feeds:v1";
-const MERGED_KEY = "merged:v1";
+const COLLECTIONS_KEY = "collections:v1";
+const CONFIG_PREFIX = "feeds:v1:"; // + collection
+const MERGED_PREFIX = "merged:v1:"; // + collection
 
 const ADMIN_HTML = `<!doctype html>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>RSS.Merge Admin</title>
 <style>
-  body{font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; max-width: 860px; margin: 2rem auto; padding: 0 1rem;}
-  code,input,button,textarea{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;}
-  input{width: 100%; padding:.6rem;}
+  body{font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; max-width: 960px; margin: 2rem auto; padding: 0 1rem;}
+  code,input,button,textarea,select{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;}
+  input,select{width: 100%; padding:.6rem;}
   button{padding:.6rem 1rem; cursor:pointer;}
   li{margin:.35rem 0;}
   .row{display:flex; gap:.5rem; align-items:center;}
   .row > *{flex: 1;}
+  .muted{color:#666; font-size:.9rem}
 </style>
 <h1>RSS.Merge</h1>
-<p>Subscribe: <a href="/feed.xml">/feed.xml</a></p>
+<p class="muted">Each collection has its own feed URL: <code>/{name}.xml</code> (e.g. <a href="/default.xml">/default.xml</a>).</p>
+
+<h2>Collection</h2>
+<div class="row">
+  <select id="col"></select>
+  <input id="newcol" placeholder="new collection name (e.g. hn)" />
+  <button id="createCol">Create</button>
+</div>
+<p class="muted">Current feed: <a id="feedLink" href="#">(select a collection)</a></p>
+
+<h2>Add feed URL</h2>
 <div class="row">
   <input id="url" placeholder="https://example.com/feed.xml" />
   <button id="add">Add</button>
 </div>
+
 <h2>Feeds</h2>
 <ul id="list"></ul>
+
 <details style="margin-top:1rem">
   <summary>Auth</summary>
-  <p>If ADMIN_TOKEN is set, paste it here:</p>
+  <p>If <code>ADMIN_TOKEN</code> is set, paste it here:</p>
   <input id="token" placeholder="ADMIN_TOKEN" />
 </details>
+
 <script>
 const $ = (s) => document.querySelector(s);
 function authHeaders(){
   const t = $('#token').value.trim();
   return t ? { 'Authorization': 'Bearer ' + t } : {};
 }
-async function load(){
-  const r = await fetch('/api/feeds', { headers: authHeaders() });
+function currentCol(){
+  return $('#col').value || 'default';
+}
+async function loadCollections(){
+  const r = await fetch('/api/collections', { headers: authHeaders() });
+  if(!r.ok){ $('#col').innerHTML = '<option>default</option>'; return; }
+  const j = await r.json();
+  const cols = j.collections || ['default'];
+  $('#col').innerHTML = cols.map(c => '<option value="' + c + '">' + c + '</option>').join('');
+}
+async function loadFeeds(){
+  const col = currentCol();
+  $('#feedLink').textContent = '/' + col + '.xml';
+  $('#feedLink').setAttribute('href', '/' + col + '.xml');
+
+  const r = await fetch('/api/feeds?collection=' + encodeURIComponent(col), { headers: authHeaders() });
   if(!r.ok){ $('#list').innerHTML = '<li><code>GET /api/feeds</code> failed: ' + r.status + '</li>'; return; }
   const j = await r.json();
   const feeds = j.feeds || [];
@@ -66,19 +99,34 @@ async function load(){
   document.querySelectorAll('button[data-del]').forEach(btn => {
     btn.onclick = async () => {
       const url = decodeURIComponent(btn.getAttribute('data-del'));
-      await fetch('/api/feeds', { method:'DELETE', headers: { ...authHeaders(), 'Content-Type':'application/json' }, body: JSON.stringify({ url }) });
-      await load();
+      await fetch('/api/feeds?collection=' + encodeURIComponent(col), { method:'DELETE', headers: { ...authHeaders(), 'Content-Type':'application/json' }, body: JSON.stringify({ url }) });
+      await loadFeeds();
     };
   });
 }
+$('#createCol').onclick = async () => {
+  const name = $('#newcol').value.trim();
+  if(!name) return;
+  await fetch('/api/collections', { method:'POST', headers: { ...authHeaders(), 'Content-Type':'application/json' }, body: JSON.stringify({ name }) });
+  $('#newcol').value='';
+  await loadCollections();
+  $('#col').value = name;
+  await loadFeeds();
+};
 $('#add').onclick = async () => {
+  const col = currentCol();
   const url = $('#url').value.trim();
   if(!url) return;
-  await fetch('/api/feeds', { method:'POST', headers: { ...authHeaders(), 'Content-Type':'application/json' }, body: JSON.stringify({ url }) });
+  await fetch('/api/feeds?collection=' + encodeURIComponent(col), { method:'POST', headers: { ...authHeaders(), 'Content-Type':'application/json' }, body: JSON.stringify({ url }) });
   $('#url').value='';
-  await load();
+  await loadFeeds();
 };
-load();
+$('#col').onchange = loadFeeds;
+
+(async function boot(){
+  await loadCollections();
+  await loadFeeds();
+})();
 </script>`;
 
 function now() {
@@ -98,8 +146,38 @@ function isAuthed(req: Request, env: Env) {
   return h === `Bearer ${token}`;
 }
 
-async function getConfig(env: Env): Promise<FeedConfig> {
-  const raw = await env.CONFIG.get(CONFIG_KEY);
+function normalizeCollection(raw: string | null): string {
+  const v = (raw || "default").trim();
+  const cleaned = v.replace(/[^a-zA-Z0-9._-]/g, "-").slice(0, 64);
+  return cleaned || "default";
+}
+
+async function getCollections(env: Env): Promise<CollectionConfig> {
+  const raw = await env.CONFIG.get(COLLECTIONS_KEY);
+  if (!raw) return { collections: ["default"] };
+  try {
+    const parsed = JSON.parse(raw);
+    const collections = Array.isArray(parsed?.collections)
+      ? parsed.collections.filter((x: any) => typeof x === "string" && x.trim())
+      : [];
+    const uniq = Array.from(
+      new Set(["default", ...collections.map((s: string) => normalizeCollection(s))]),
+    );
+    return { collections: uniq };
+  } catch {
+    return { collections: ["default"] };
+  }
+}
+
+async function addCollection(env: Env, name: string) {
+  const cfg = await getCollections(env);
+  cfg.collections.push(normalizeCollection(name));
+  const uniq = Array.from(new Set(cfg.collections));
+  await env.CONFIG.put(COLLECTIONS_KEY, JSON.stringify({ collections: uniq }));
+}
+
+async function getConfig(env: Env, collection: string): Promise<FeedConfig> {
+  const raw = await env.CONFIG.get(CONFIG_PREFIX + collection);
   if (!raw) return { feeds: [] };
   try {
     const parsed = JSON.parse(raw);
@@ -112,9 +190,9 @@ async function getConfig(env: Env): Promise<FeedConfig> {
   }
 }
 
-async function setConfig(env: Env, cfg: FeedConfig) {
+async function setConfig(env: Env, collection: string, cfg: FeedConfig) {
   const uniq = Array.from(new Set(cfg.feeds.map((s) => s.trim()).filter(Boolean)));
-  await env.CONFIG.put(CONFIG_KEY, JSON.stringify({ feeds: uniq }));
+  await env.CONFIG.put(CONFIG_PREFIX + collection, JSON.stringify({ feeds: uniq }));
 }
 
 function xmlText(el: Element | null): string {
@@ -271,8 +349,8 @@ function toRss2(env: Env, items: Item[]): string {
   );
 }
 
-async function buildMerged(env: Env): Promise<string> {
-  const cfg = await getConfig(env);
+async function buildMerged(env: Env, collection: string): Promise<string> {
+  const cfg = await getConfig(env, collection);
   const feeds = cfg.feeds;
   const all = (await Promise.all(feeds.map((u) => getFeedItemsCached(env, u)))).flat();
 
@@ -288,17 +366,18 @@ async function buildMerged(env: Env): Promise<string> {
   return toRss2(env, limited);
 }
 
-async function getMergedCached(env: Env): Promise<string> {
+async function getMergedCached(env: Env, collection: string): Promise<string> {
   const ttlMin = mins(env, "MERGED_TTL_MINUTES", 10);
-  const cached = await env.CACHE.get(MERGED_KEY);
-  const tsRaw = await env.CACHE.get(MERGED_KEY + ":ts");
+  const key = MERGED_PREFIX + collection;
+  const cached = await env.CACHE.get(key);
+  const tsRaw = await env.CACHE.get(key + ":ts");
   if (cached && tsRaw) {
     const age = now() - Number(tsRaw);
     if (age < ttlMin * 60_000) return cached;
   }
-  const xml = await buildMerged(env);
-  await env.CACHE.put(MERGED_KEY, xml, { expirationTtl: ttlMin * 60 });
-  await env.CACHE.put(MERGED_KEY + ":ts", String(now()), { expirationTtl: ttlMin * 60 });
+  const xml = await buildMerged(env, collection);
+  await env.CACHE.put(key, xml, { expirationTtl: ttlMin * 60 });
+  await env.CACHE.put(key + ":ts", String(now()), { expirationTtl: ttlMin * 60 });
   return xml;
 }
 
@@ -308,13 +387,24 @@ export default {
 
     if (url.pathname === "/" || url.pathname === "") {
       return new Response(
-        `RSS.Merge\n\n- Feed: ${url.origin}/feed.xml\n- Admin: ${url.origin}/admin\n`,
+        `RSS.Merge\n\n- Feed (legacy): ${url.origin}/feed.xml\n- Feed: ${url.origin}/default.xml\n- Admin: ${url.origin}/admin\n`,
         { headers: { "content-type": "text/plain; charset=utf-8" } },
       );
     }
 
+    // Feed endpoints:
+    // - /feed.xml (legacy default)
+    // - /{collection}.xml
     if (url.pathname === "/feed.xml") {
-      const xml = await getMergedCached(env);
+      const xml = await getMergedCached(env, "default");
+      return new Response(xml, {
+        headers: { "content-type": "application/rss+xml; charset=utf-8" },
+      });
+    }
+    if (url.pathname.endsWith(".xml") && url.pathname.length > 5) {
+      const name = url.pathname.slice(1, -4); // trim / and .xml
+      const collection = normalizeCollection(name);
+      const xml = await getMergedCached(env, collection);
       return new Response(xml, {
         headers: { "content-type": "application/rss+xml; charset=utf-8" },
       });
@@ -325,32 +415,52 @@ export default {
       return new Response(ADMIN_HTML, { headers: { "content-type": "text/html; charset=utf-8" } });
     }
 
-    if (url.pathname === "/api/feeds") {
+    if (url.pathname === "/api/collections") {
       if (!isAuthed(req, env))
         return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
       if (req.method === "GET") {
-        return Response.json(await getConfig(env));
+        return Response.json(await getCollections(env));
+      }
+      if (req.method === "POST") {
+        const body = (await req.json().catch(() => null)) as any;
+        const name = String(body?.name || "").trim();
+        if (!name) return new Response(JSON.stringify({ error: "missing name" }), { status: 400 });
+        await addCollection(env, name);
+        return Response.json({ ok: true });
+      }
+      return new Response(JSON.stringify({ error: "method not allowed" }), { status: 405 });
+    }
+
+    if (url.pathname === "/api/feeds") {
+      if (!isAuthed(req, env))
+        return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401 });
+      const collection = normalizeCollection(url.searchParams.get("collection"));
+
+      if (req.method === "GET") {
+        return Response.json(await getConfig(env, collection));
       }
       if (req.method === "POST") {
         const body = (await req.json().catch(() => null)) as any;
         const u = String(body?.url || "").trim();
         if (!u) return new Response(JSON.stringify({ error: "missing url" }), { status: 400 });
-        const cfg = await getConfig(env);
+        const cfg = await getConfig(env, collection);
         cfg.feeds.push(u);
-        await setConfig(env, cfg);
+        await setConfig(env, collection, cfg);
         // bust merged cache
-        ctx.waitUntil(env.CACHE.delete(MERGED_KEY));
-        ctx.waitUntil(env.CACHE.delete(MERGED_KEY + ":ts"));
+        const key = MERGED_PREFIX + collection;
+        ctx.waitUntil(env.CACHE.delete(key));
+        ctx.waitUntil(env.CACHE.delete(key + ":ts"));
         return Response.json({ ok: true });
       }
       if (req.method === "DELETE") {
         const body = (await req.json().catch(() => null)) as any;
         const u = String(body?.url || "").trim();
-        const cfg = await getConfig(env);
+        const cfg = await getConfig(env, collection);
         cfg.feeds = cfg.feeds.filter((x) => x !== u);
-        await setConfig(env, cfg);
-        ctx.waitUntil(env.CACHE.delete(MERGED_KEY));
-        ctx.waitUntil(env.CACHE.delete(MERGED_KEY + ":ts"));
+        await setConfig(env, collection, cfg);
+        const key = MERGED_PREFIX + collection;
+        ctx.waitUntil(env.CACHE.delete(key));
+        ctx.waitUntil(env.CACHE.delete(key + ":ts"));
         return Response.json({ ok: true });
       }
       return new Response(JSON.stringify({ error: "method not allowed" }), { status: 405 });
@@ -360,7 +470,10 @@ export default {
   },
 
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
-    // Pre-warm merged feed cache.
-    ctx.waitUntil(getMergedCached(env).then(() => void 0));
+    // Pre-warm merged feed cache for all collections.
+    const cols = await getCollections(env);
+    for (const c of cols.collections) {
+      ctx.waitUntil(getMergedCached(env, c).then(() => void 0));
+    }
   },
 };
