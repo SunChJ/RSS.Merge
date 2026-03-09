@@ -1,0 +1,15 @@
+{
+  "name": "rss-merge-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "fmt": "prettier -w ."
+  },
+  "devDependencies": {
+    "prettier": "^3.5.2",
+    "wrangler": "^4.10.0"
+  }
+}

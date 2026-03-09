@@ -1,0 +1,27 @@
+name = "rss-merge"
+main = "src/index.ts"
+compatibility_date = "2026-03-09"
+
+# KV namespaces:
+# - CONFIG: stores feed list (JSON)
+# - CACHE: stores per-feed parsed items + merged output
+
+[[kv_namespaces]]
+binding = "CONFIG"
+id = "REPLACE_WITH_CONFIG_KV_ID"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "REPLACE_WITH_CACHE_KV_ID"
+
+[triggers]
+crons = ["*/15 * * * *"]
+
+[vars]
+# Optional: set to require auth on /admin and /api/*
+# ADMIN_TOKEN = "..."
+FEED_TTL_MINUTES = "20"
+MERGED_TTL_MINUTES = "10"
+TITLE = "Merged Feed"
+DESCRIPTION = "Merged RSS feed"
+SITE_URL = "https://example.com"
