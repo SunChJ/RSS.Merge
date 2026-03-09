@@ -13,6 +13,14 @@ A small RSS merge service (rss.app-like “bundle into one feed”).
 
 ## Deploy
 
+### Option 1 (recommended): zero manual KV id setup
+
+1. `npm i`
+2. `npm run setup` (creates 2 KV namespaces + patches `wrangler.toml` automatically)
+3. `npm run deploy`
+
+### Option 2: manual
+
 1. Create two KV namespaces in Cloudflare:
    - `rss-merge-config`
    - `rss-merge-cache`
