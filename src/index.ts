@@ -1,3 +1,4 @@
+import { DOMParser } from "linkedom";
 export interface Env {
   // Optional KV bindings. If not provided, the worker still runs using vars + Cache API.
   CONFIG?: KVNamespace;
@@ -301,13 +302,14 @@ function pickDesc(itemEl: Element): string {
   return (
     xmlText(itemEl.querySelector("description")) ||
     xmlText(itemEl.querySelector("summary")) ||
+    xmlText(itemEl.getElementsByTagName("content:encoded")[0]) ||
     xmlText(itemEl.querySelector("content"))
   );
 }
 
 function parseFeedXml(xml: string): Item[] {
   const doc = new DOMParser().parseFromString(xml, "text/xml");
-  const hasParserError = doc.querySelector("parsererror");
+  const hasParserError = doc.getElementsByTagName("parsererror")[0];
   if (hasParserError) return [];
 
   // RSS

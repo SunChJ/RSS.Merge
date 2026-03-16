@@ -12,5 +12,9 @@
   "devDependencies": {
     "prettier": "^3.5.2",
     "wrangler": "^4.10.0"
+  },
+  "dependencies": {
+    "@xmldom/xmldom": "^0.8.11",
+    "linkedom": "^0.18.12"
   }
 }
